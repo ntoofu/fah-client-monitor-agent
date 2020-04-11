@@ -125,28 +125,47 @@ func Connect(endpoint string) (*FAHWatcher, chan error, error) {
 	return &FAHWatcher{netConn, hbChan, qiChan, siChan}, errChan, nil
 }
 
+type FAHUpdatesId int
+
+const (
+	heartbeatUpdatesId FAHUpdatesId = iota
+	queueInfoUpdatesId
+	slotInfoUpdatesId
+)
+
 func (fahw *FAHWatcher) WatchHeartbeat(interval int) (chan int, error) {
-	_, err := fahw.netConn.Write([]byte(fmt.Sprintf("updates add 0 %d $heartbeat\n", interval)))
+	command := fmt.Sprintf("updates add %d %d $heartbeat\n", heartbeatUpdatesId, interval)
+	err := sendCommand(fahw.netConn, command)
 	if err != nil {
-		return nil, errors.Wrap(err, "Error occured during sending `updates add ... $heartbeat` to FAHClient")
+		return nil, err
 	}
 	return fahw.hbChan, nil
 }
 
 func (fahw *FAHWatcher) WatchQueueInfo(interval int) (chan QueueInfo, error) {
-	_, err := fahw.netConn.Write([]byte(fmt.Sprintf("updates add 1 %d $queue-info\n", interval)))
+	command := fmt.Sprintf("updates add %d %d $queue-info\n", queueInfoUpdatesId, interval)
+	err := sendCommand(fahw.netConn, command)
 	if err != nil {
-		return nil, errors.Wrap(err, "Error occured during sending `updates add ... $queue-info` to FAHClient")
+		return nil, err
 	}
 	return fahw.qiChan, nil
 }
 
 func (fahw *FAHWatcher) WatchSlotInfo(interval int) (chan SlotInfo, error) {
-	_, err := fahw.netConn.Write([]byte(fmt.Sprintf("updates add 2 %d $slot-info\n", interval)))
+	command := fmt.Sprintf("updates add %d %d $slot-info\n", slotInfoUpdatesId, interval)
+	err := sendCommand(fahw.netConn, command)
 	if err != nil {
-		return nil, errors.Wrap(err, "Error occured during sending `updates add ... $slot-info` to FAHClient")
+		return nil, err
 	}
 	return fahw.siChan, nil
+}
+
+func sendCommand(netConn net.Conn, command string) error {
+	_, err := netConn.Write([]byte(command))
+	if err != nil {
+		return errors.Wrapf(err, "Error occured during sending `%s` to FAHClient", command)
+	}
+	return nil
 }
 
 func rxMessageRouter(netConn net.Conn, hbChan chan int, qiChan chan QueueInfo, siChan chan SlotInfo) error {
