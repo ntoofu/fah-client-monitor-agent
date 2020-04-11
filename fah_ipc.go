@@ -41,10 +41,59 @@ type QueueInfo struct {
 	Basecredit     string
 }
 
+type SlotInfo struct {
+	Id          string
+	Status      string
+	Description string
+	// Options       ?? (not inspected yet)
+	Reason string
+	Idle   bool
+}
+
 type FAHWatcher struct {
 	netConn net.Conn
 	hbChan  chan int
 	qiChan  chan QueueInfo
+	siChan  chan SlotInfo
+}
+
+type SlotInfoStreamJSONifier struct {
+	r                      io.Reader
+	idleFieldMatchedLength int
+}
+
+func NewSlotInfoStreamJSONifier(r io.Reader) *SlotInfoStreamJSONifier {
+	return &SlotInfoStreamJSONifier{r, 0}
+}
+
+// Since boolean literals are 'True' or 'False' in PyON format
+// while they are 'true' or 'false' in JSON, conversion is necessary.
+// Without conversion, `encoding/json` fails during scanner.go, which
+// `UnmarshalJSON` is not affected.
+func (s *SlotInfoStreamJSONifier) Read(p []byte) (int, error) {
+	idleFieldMatcher := `"idle": `
+	n, err := s.r.Read(p)
+	if err != nil {
+		return n, err
+	}
+	for i, c := range p[0:n] {
+		if s.idleFieldMatchedLength < len(idleFieldMatcher) {
+			if c == idleFieldMatcher[s.idleFieldMatchedLength] {
+				s.idleFieldMatchedLength++
+			} else {
+				s.idleFieldMatchedLength = 0
+			}
+		} else {
+			switch c {
+			case 'T':
+				p[i] = 't'
+			case 'F':
+				p[i] = 'f'
+			}
+			s.idleFieldMatchedLength = 0
+		}
+	}
+	return n, nil
 }
 
 func Connect(endpoint string) (*FAHWatcher, chan error, error) {
@@ -61,10 +110,11 @@ func Connect(endpoint string) (*FAHWatcher, chan error, error) {
 
 	hbChan := make(chan int)
 	qiChan := make(chan QueueInfo)
+	siChan := make(chan SlotInfo)
 	errChan := make(chan error)
 	go func() {
 		for {
-			err = rxMessageRouter(netConn, hbChan, qiChan)
+			err = rxMessageRouter(netConn, hbChan, qiChan, siChan)
 			errChan <- err
 			if err == io.EOF {
 				return
@@ -72,7 +122,7 @@ func Connect(endpoint string) (*FAHWatcher, chan error, error) {
 			time.Sleep(5 * time.Second)
 		}
 	}()
-	return &FAHWatcher{netConn, hbChan, qiChan}, errChan, nil
+	return &FAHWatcher{netConn, hbChan, qiChan, siChan}, errChan, nil
 }
 
 func (fahw *FAHWatcher) WatchHeartbeat(interval int) (chan int, error) {
@@ -91,7 +141,15 @@ func (fahw *FAHWatcher) WatchQueueInfo(interval int) (chan QueueInfo, error) {
 	return fahw.qiChan, nil
 }
 
-func rxMessageRouter(netConn net.Conn, hbChan chan int, qiChan chan QueueInfo) error {
+func (fahw *FAHWatcher) WatchSlotInfo(interval int) (chan SlotInfo, error) {
+	_, err := fahw.netConn.Write([]byte(fmt.Sprintf("updates add 2 %d $slot-info\n", interval)))
+	if err != nil {
+		return nil, errors.Wrap(err, "Error occured during sending `updates add ... $slot-info` to FAHClient")
+	}
+	return fahw.siChan, nil
+}
+
+func rxMessageRouter(netConn net.Conn, hbChan chan int, qiChan chan QueueInfo, siChan chan SlotInfo) error {
 	var reader io.Reader
 	reader = netConn
 	for {
@@ -137,6 +195,14 @@ func rxMessageRouter(netConn net.Conn, hbChan chan int, qiChan chan QueueInfo) e
 			}
 			reader = io.MultiReader(remainingReader, reader)
 		case "slots":
+			slots, remainingReader, err := parseSlotInfo(reader)
+			if err != nil {
+				return errors.Wrap(err, "Error occured while parsing slot-info")
+			}
+			for _, s := range slots {
+				siChan <- s
+			}
+			reader = io.MultiReader(remainingReader, reader)
 		}
 		buf = make([]byte, 5)
 		_, err = reader.Read(buf)
@@ -184,4 +250,14 @@ func parseQueueInfo(r io.Reader) ([]QueueInfo, io.Reader, error) {
 		return nil, nil, errors.Wrap(err, "Error occured while queue-info result is parsed")
 	}
 	return qs, dec.Buffered(), nil
+}
+
+func parseSlotInfo(r io.Reader) ([]SlotInfo, io.Reader, error) {
+	dec := json.NewDecoder(NewSlotInfoStreamJSONifier(r))
+	var slots []SlotInfo
+	err := dec.Decode(&slots)
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "Error occured while slot-info result is parsed")
+	}
+	return slots, dec.Buffered(), nil
 }

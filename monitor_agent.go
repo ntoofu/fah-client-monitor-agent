@@ -76,6 +76,17 @@ type QueueInfoForEs struct {
 	BaseCredit     int     `json:"base_credit"`
 }
 
+type SlotInfoForEs struct {
+	Timestamp   string `json:"@timestamp"`
+	ClientName  string `json:"client_name"`
+	ClientSlot  string `json:"client_slot"`
+	Id          string `json:"id"`
+	Status      string `json:"status"`
+	Description string `json:"description"`
+	Reason      string `json:"reason"`
+	Idle        bool   `json:"idle"`
+}
+
 func esIndexSuffix() string {
 	t := time.Now()
 	return fmt.Sprintf("_%d-%d", t.Year(), t.Month())
@@ -128,6 +139,19 @@ func formatQueueInfoForEs(qi QueueInfo, clientName string) QueueInfoForEs {
 	}
 }
 
+func formatSlotInfoForEs(si SlotInfo, clientName string) SlotInfoForEs {
+	return SlotInfoForEs{
+		Timestamp:   time.Now().Format(time.RFC3339),
+		ClientName:  clientName,
+		ClientSlot:  clientName + "/" + si.Id,
+		Id:          si.Id,
+		Status:      si.Status,
+		Description: si.Description,
+		Reason:      si.Reason,
+		Idle:        si.Idle,
+	}
+}
+
 func main() {
 	cliArgs := parseCliArgs()
 	esCfg := elasticsearch.Config{
@@ -145,6 +169,7 @@ func main() {
 
 	hbChan, err := fahw.WatchHeartbeat(60)
 	qiChan, err := fahw.WatchQueueInfo(30)
+	siChan, err := fahw.WatchSlotInfo(30)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -171,6 +196,19 @@ func main() {
 			}
 			go func() {
 				res, err := es.Index("foldingathome-queueinfo"+esIndexSuffix(), bytes.NewReader(body))
+				if err != nil {
+					log.Print(err)
+				}
+				res.Body.Close()
+			}()
+		case si := <-siChan:
+			body, err := json.Marshal(formatSlotInfoForEs(si, cliArgs.ClientName))
+			if err != nil {
+				log.Print(err)
+				continue
+			}
+			go func() {
+				res, err := es.Index("foldingathome-slotinfo"+esIndexSuffix(), bytes.NewReader(body))
 				if err != nil {
 					log.Print(err)
 				}
