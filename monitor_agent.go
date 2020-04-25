@@ -167,9 +167,9 @@ func main() {
 		log.Fatal(err)
 	}
 
-	hbChan, err := fahw.WatchHeartbeat(60)
-	qiChan, err := fahw.WatchQueueInfo(30)
-	siChan, err := fahw.WatchSlotInfo(30)
+	hbChan := fahw.WatchHeartbeat(60)
+	qiChan := fahw.WatchQueueInfo(30, false)
+	siChan := fahw.WatchSlotInfo(30, false)
 	if err != nil {
 		log.Fatal(err)
 	}

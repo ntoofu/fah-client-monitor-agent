@@ -51,10 +51,12 @@ type SlotInfo struct {
 }
 
 type FAHWatcher struct {
-	netConn net.Conn
-	hbChan  chan int
-	qiChan  chan QueueInfo
-	siChan  chan SlotInfo
+	hbChan      chan int
+	qiChan      chan QueueInfo
+	siChan      chan SlotInfo
+	cmdQueue    chan string
+	qiCmdSender *RepetitiveExecutor
+	siCmdSender *RepetitiveExecutor
 }
 
 type SlotInfoStreamJSONifier struct {
@@ -112,17 +114,56 @@ func Connect(endpoint string) (*FAHWatcher, chan error, error) {
 	qiChan := make(chan QueueInfo)
 	siChan := make(chan SlotInfo)
 	errChan := make(chan error)
+	cmdQueue := make(chan string)
+
 	go func() {
+		var reader io.Reader
+		reader = netConn
 		for {
-			err = rxMessageRouter(netConn, hbChan, qiChan, siChan)
+			err = rxMessageRouter(reader, hbChan, qiChan, siChan)
 			errChan <- err
 			if err == io.EOF {
 				return
 			}
-			time.Sleep(5 * time.Second)
+			time.Sleep(5 * time.Second) // wait before retry
 		}
 	}()
-	return &FAHWatcher{netConn, hbChan, qiChan, siChan}, errChan, nil
+	go func() {
+		for cmd := range cmdQueue {
+			err := sendCommand(netConn, cmd)
+			if err != nil {
+				errChan <- errors.Wrapf(err, "Error occured during sending `%s` to FAHClient", cmd)
+			}
+		}
+	}()
+	return &FAHWatcher{hbChan, qiChan, siChan, cmdQueue, nil, nil}, errChan, nil
+}
+
+type RepetitiveExecutor struct {
+	ticker   *time.Ticker
+	finished chan bool
+}
+
+func NewRepetitiveExecutor(f func(), t time.Duration) *RepetitiveExecutor {
+	fin := make(chan bool)
+	tick := time.NewTicker(t)
+	go func() {
+	loop:
+		for {
+			select {
+			case <-tick.C:
+				f()
+			case <-fin:
+				break loop
+			}
+		}
+	}()
+	return &RepetitiveExecutor{tick, fin}
+}
+
+func (re *RepetitiveExecutor) Close() {
+	re.ticker.Stop()
+	re.finished <- true
 }
 
 type FAHUpdatesId int
@@ -133,31 +174,42 @@ const (
 	slotInfoUpdatesId
 )
 
-func (fahw *FAHWatcher) WatchHeartbeat(interval int) (chan int, error) {
+func (fahw *FAHWatcher) WatchHeartbeat(interval int) chan int {
 	command := fmt.Sprintf("updates add %d %d $heartbeat\n", heartbeatUpdatesId, interval)
-	err := sendCommand(fahw.netConn, command)
-	if err != nil {
-		return nil, err
-	}
-	return fahw.hbChan, nil
+	fahw.cmdQueue <- command
+	return fahw.hbChan
 }
 
-func (fahw *FAHWatcher) WatchQueueInfo(interval int) (chan QueueInfo, error) {
-	command := fmt.Sprintf("updates add %d %d $queue-info\n", queueInfoUpdatesId, interval)
-	err := sendCommand(fahw.netConn, command)
-	if err != nil {
-		return nil, err
+func (fahw *FAHWatcher) WatchQueueInfo(interval int, updatesOnly bool) chan QueueInfo {
+	if fahw.qiCmdSender != nil {
+		fahw.qiCmdSender.Close()
 	}
-	return fahw.qiChan, nil
+	if updatesOnly {
+		command := fmt.Sprintf("updates add %d %d $queue-info\n", queueInfoUpdatesId, interval)
+		fahw.cmdQueue <- command
+	} else {
+		command := fmt.Sprintf("updates del %d\n", queueInfoUpdatesId)
+		fahw.cmdQueue <- command
+		f := func() { fahw.cmdQueue <- "queue-info\n"}
+		fahw.qiCmdSender = NewRepetitiveExecutor(f, time.Duration(interval)*time.Second)
+	}
+	return fahw.qiChan
 }
 
-func (fahw *FAHWatcher) WatchSlotInfo(interval int) (chan SlotInfo, error) {
-	command := fmt.Sprintf("updates add %d %d $slot-info\n", slotInfoUpdatesId, interval)
-	err := sendCommand(fahw.netConn, command)
-	if err != nil {
-		return nil, err
+func (fahw *FAHWatcher) WatchSlotInfo(interval int, updatesOnly bool) chan SlotInfo {
+	if fahw.siCmdSender != nil {
+		fahw.siCmdSender.Close()
 	}
-	return fahw.siChan, nil
+	if updatesOnly {
+		command := fmt.Sprintf("updates add %d %d $slot-info\n", slotInfoUpdatesId, interval)
+		fahw.cmdQueue <- command
+	} else {
+		command := fmt.Sprintf("updates del %d\n", slotInfoUpdatesId)
+		fahw.cmdQueue <- command
+		f := func() { fahw.cmdQueue <- "slot-info\n"}
+		fahw.siCmdSender = NewRepetitiveExecutor(f, time.Duration(interval)*time.Second)
+	}
+	return fahw.siChan
 }
 
 func sendCommand(netConn net.Conn, command string) error {
@@ -168,7 +220,7 @@ func sendCommand(netConn net.Conn, command string) error {
 	return nil
 }
 
-func rxMessageRouter(netConn net.Conn, hbChan chan int, qiChan chan QueueInfo, siChan chan SlotInfo) error {
+func rxMessageRouter(netConn io.Reader, hbChan chan int, qiChan chan QueueInfo, siChan chan SlotInfo) error {
 	var reader io.Reader
 	reader = netConn
 	for {
